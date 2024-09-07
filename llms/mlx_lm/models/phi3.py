@@ -1,10 +1,12 @@
+# Copyright © 2023-2024 Apple Inc.
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, KVCache
+from .base import BaseModelArgs, KVCache, create_attention_mask
 from .su_rope import SuScaledRotaryEmbedding
 
 
@@ -33,9 +35,9 @@ class ModelArgs(BaseModelArgs):
             if not all(key in self.rope_scaling for key in required_keys):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
-            if self.rope_scaling["type"] not in ["su", "linear"]:
+            if self.rope_scaling["type"] not in ["longrope", "su", "linear"]:
                 print(
-                    "[WARNING] rope_scaling 'type' currently only supports 'linear' and 'su'; setting rope scaling to false."
+                    "[WARNING] rope_scaling 'type' currently only supports 'linear', 'su', and 'longrope'; setting rope scaling to false."
                 )
                 self.rope_scaling = None
 
@@ -57,19 +59,17 @@ class Attention(nn.Module):
         self.qkv_proj = nn.Linear(dim, op_size, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_scale = 1.0
-        if args.rope_scaling and args.rope_scaling["type"] == "su":
+        if args.rope_scaling and args.rope_scaling["type"] in ["longrope", "su"]:
             self.rope = SuScaledRotaryEmbedding(
                 head_dim,
-                traditional=False,
                 base=args.rope_theta,
-                scale=rope_scale,
                 max_position_embeddings=args.max_position_embeddings,
                 original_max_position_embeddings=args.original_max_position_embeddings,
                 short_factor=args.rope_scaling["short_factor"],
                 long_factor=args.rope_scaling["long_factor"],
             )
         else:
+            rope_scale = 1.0
             if args.rope_scaling and args.rope_scaling["type"] == "linear":
                 assert isinstance(args.rope_scaling["factor"], float)
                 rope_scale = 1 / args.rope_scaling["factor"]
@@ -172,10 +172,7 @@ class Phi3Model(nn.Module):
     ):
         h = self.embed_tokens(inputs)
 
-        mask = None
-        if h.shape[1] > 1:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+        mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
