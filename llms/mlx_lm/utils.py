@@ -14,7 +14,6 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type, 
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
-from huggingface_hub.utils._errors import RepositoryNotFoundError
 from mlx.utils import tree_flatten
 from transformers import PreTrainedTokenizer
 
@@ -22,8 +21,8 @@ from transformers import PreTrainedTokenizer
 from .models.base import KVCache, RotatingKVCache
 from .sample_utils import categorical_sampling, min_p_sampling, top_p_sampling
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-from .tuner.utils import apply_lora_layers
 from .tuner.utils import dequantize as dequantize_model
+from .tuner.utils import load_adapters
 
 # Constants
 MODEL_REMAPPING = {
@@ -91,7 +90,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     ],
                 )
             )
-        except RepositoryNotFoundError:
+        except:
             raise ModelNotFoundError(
                 f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
                 "Please make sure you specified the local path or Hugging Face"
@@ -102,7 +101,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     return model_path
 
 
-def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
+def apply_repetition_penalty(logits: mx.array, tokens: mx.array, penalty: float):
     """
     Apply repetition penalty to specific logits based on the given context.
 
@@ -110,19 +109,18 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
 
     Args:
         logits (mx.array): The logits produced by the language model.
-        generated_tokens (any): A list of N previous tokens.
+        tokens (mx.array): A list of N previous tokens.
         penalty (float): The repetition penalty factor to be applied.
 
     Returns:
         logits (mx.array): Logits with repetition penalty applied to generated tokens.
     """
-    if len(generated_tokens) > 0:
-        indices = mx.array([token for token in generated_tokens])
-        selected_logits = logits[:, indices]
+    if len(tokens) > 0:
+        selected_logits = logits[:, tokens]
         selected_logits = mx.where(
             selected_logits < 0, selected_logits * penalty, selected_logits / penalty
         )
-        logits[:, indices] = selected_logits
+        logits[:, tokens] = selected_logits
     return logits
 
 
@@ -155,10 +153,11 @@ def generate_step(
     top_p: float = 1.0,
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
-    logit_bias: Optional[Dict[int, float]] = None,
     prefill_step_size: int = 512,
     max_kv_size: Optional[int] = None,
     cache_history: Optional[List[Tuple[mx.array, mx.array]]] = None,
+    logit_bias: Optional[Dict[int, float]] = None,
+    logits_processor: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -178,10 +177,13 @@ def generate_step(
           probability) that a token probability must have to be considered.
         min_tokens_to_keep (int, optional): Minimum number of tokens that cannot
           be filtered by min_p sampling.
-        logit_bias (dictionary, optional): Additive logit bias.
         prefill_step_size (int): Step size for processing the prompt.
         max_kv_size (int, optional): Maximum size of the key-value cache. Old
           entries (except the first 4 tokens) will be overwritten.
+        logit_bias (dictionary, optional): Additive logit bias.
+        logits_processor (List[Callable[[mx.array, mx.array], mx.array]], optional):
+            A list of functions that take tokens and logits and return the processed
+            logits. Default: ``None``.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -189,10 +191,6 @@ def generate_step(
     """
 
     def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
 
         if temp == 0:
@@ -214,7 +212,29 @@ def generate_step(
             f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
         )
 
+    logits_processor = logits_processor or []
+
+    if repetition_penalty:
+
+        def repetition_penalty_processor(tokens, logits):
+            return apply_repetition_penalty(
+                logits, tokens[-repetition_context_size:], repetition_penalty
+            )
+
+        logits_processor.append(repetition_penalty_processor)
+
+    if logit_bias:
+        indices = mx.array(list(logit_bias.keys()))
+        values = mx.array(list(logit_bias.values()))
+
+        def logit_bias_processor(_, logits):
+            logits[:, indices] += values
+            return logits
+
+        logits_processor.append(logit_bias_processor)
+
     y = prompt
+    tokens = None
 
     # Create the KV cache for generation
     cache = make_kv_caches(model, max_kv_size)
@@ -229,28 +249,18 @@ def generate_step(
             c.update_and_fetch(h[0], h[1])
         mx.eval([c.state for c in cache])
 
-    repetition_context = prompt.tolist()
-
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
     def _step(y):
-        nonlocal repetition_context
         logits = model(y[None], cache=cache)
         logits = logits[:, -1, :]
 
-        if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, logprobs = sample(logits)
-            repetition_context.append(y.item())
-        else:
-            y, logprobs = sample(logits)
+        if logits_processor:
+            nonlocal tokens
+            tokens = mx.concat([tokens, y]) if tokens is not None else y
 
-        if repetition_context_size:
-            if len(repetition_context) > repetition_context_size:
-                repetition_context = repetition_context[-repetition_context_size:]
+            for processor in logits_processor:
+                logits = processor(tokens, logits)
+
+        y, logprobs = sample(logits)
         return y, logprobs.squeeze(0)
 
     while y.size > prefill_step_size:
@@ -503,7 +513,7 @@ def load(
 
     model = load_model(model_path, lazy, model_config)
     if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
+        model = load_adapters(model, adapter_path)
         model.eval()
     tokenizer = load_tokenizer(model_path, tokenizer_config)
 
@@ -577,7 +587,16 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         from mlx_lm import load, generate
 
         model, tokenizer = load("{upload_repo}")
-        response = generate(model, tokenizer, prompt="hello", verbose=True)
+
+        prompt="hello"
+
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            messages = [{{"role": "user", "content": prompt}}]
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+        response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
         """
     )
